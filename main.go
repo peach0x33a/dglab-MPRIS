@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,7 +24,6 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 	"github.com/gorilla/websocket"
-	qrterminal "github.com/mdp/qrterminal/v3"
 )
 
 // ============================================================
@@ -106,9 +106,22 @@ type AppState struct {
 var (
 	state    = &AppState{}
 	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool {
+			// 仅允许同源或空 origin（移动端 APP 直接连接无 browser context）
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			// 允许同源请求
+			if origin == "null" || strings.HasPrefix(origin, "file://") {
+				return true
+			}
+			return false
+		},
 	}
-	boundCh = make(chan struct{}, 1)
+	boundCh           = make(chan struct{}, 1)
+	quitCh            = make(chan struct{}) // 用于优雅停止后台 goroutine
+	qrDisconnectedCh  = make(chan struct{}) // 通知 TUI 显示二维码
 )
 
 // ============================================================
@@ -118,7 +131,9 @@ var (
 // generateID 生成随机十六进制 ID
 func generateID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("[安全] 生成随机 ID 失败: %v", err)
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -207,6 +222,62 @@ func selectBindAddress(reader *bufio.Reader) string {
 	}
 }
 
+// resetTerminalReset 尝试重置终端状态，兼容 Konsole 等终端
+func resetTerminal() {
+	// 尝试 tput reset（优先）
+	cmd := exec.Command("tput", "reset")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		// fallback 到 reset 命令
+		cmd2 := exec.Command("reset")
+		cmd2.Stdout = os.Stdout
+		cmd2.Stderr = os.Stderr
+		cmd2.Run()
+	}
+}
+
+// selectAddressOnlyTUI 仅用于地址选择，返回选中的地址
+func selectAddressOnlyTUI(addrs []ifaceAddr, port int, clientID string) string {
+	quitCh := make(chan string)
+	model := NewSelectAddressModel(addrs, quitCh, port, clientID)
+
+	p := tea.NewProgram(model)
+
+	doneCh := make(chan struct{})
+	var result string
+
+	go func() {
+		defer close(doneCh)
+		if _, err := p.Run(); err != nil {
+			log.Printf("启动 TUI 失败: %v\n", err)
+		}
+		resetTerminal()
+	}()
+
+	select {
+	case addr := <-quitCh:
+		result = addr
+	case <-doneCh:
+		result = ""
+	}
+
+	return result
+}
+
+// selectBindAddressTUI 使用 TUI 交互式选择绑定地址并等待 APP 连接
+// 返回 true 如果用户选择退出，false 如果继续
+func selectBindAddressTUI(bindAddr string, port int, clientID string) bool {
+	model := NewSelectAddressModel(getLocalAddresses(), nil, port, clientID)
+
+	p := tea.NewProgram(model)
+	if _, err := p.Run(); err != nil {
+		log.Printf("启动 TUI 失败: %v\n", err)
+	}
+	resetTerminal()
+	return model.shouldQuit
+}
+
 // writeToApp 线程安全地向 APP 发送消息
 func writeToApp(data []byte) error {
 	state.appWriteMu.Lock()
@@ -230,10 +301,11 @@ func (r *MprisRoot) Quit() *dbus.Error {
 	log.Printf("[MPRIS] Quit 被调用 (Channel %d)...\n", r.channelId)
 
 	state.mu.Lock()
-	if state.appConn != nil {
-		sendStrengthLocked(2, r.channelId, 0)
+	defer state.mu.Unlock()
+	if state.appConn == nil || state.clientID == "" || state.targetID == "" {
+		return nil
 	}
-	state.mu.Unlock()
+	sendStrengthLocked(2, r.channelId, 0)
 	return nil
 }
 
@@ -360,27 +432,62 @@ func (m *MprisPlayer) Previous() *dbus.Error {
 	return nil
 }
 
+// microsecondsPerUnit 表示微秒与强度单位之间的转换因子
+// MPRIS 使用微秒作为时间单位，而本应用中 1 单位强度 = 1,000,000 微秒 = 1 秒
+const microsecondsPerUnit = 1000000
+
 // Seek 偏移当前位置（微秒 → 强度值）
+// 根据 MPRIS2 规范，offset 是相对于指定位置的时间偏移量（微秒）
+// 正值表示快进，负值表示快退
 func (m *MprisPlayer) Seek(offset int64) *dbus.Error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
+
+	// 未配对时直接返回，符合 MPRIS 规范的幂等性要求
 	if !state.paired {
 		return nil
 	}
 
-	log.Printf("[MPRIS] Seek(%d) called by KDE for Channel %d", offset, m.channelId)
+	// 确保 MPRIS 服务已就绪
+	if !state.mprisReady {
+		return nil
+	}
 
 	currentStrength, _, maxLimit := m.getStrengthAndMax()
-	currentPos := int64(currentStrength) * 1000000
+
+	// 计算新位置：当前强度(微秒) + 偏移量(微秒)
+	currentPos := int64(currentStrength) * microsecondsPerUnit
 	newPos := currentPos + offset
-	newStrength := int(newPos / 1000000)
+
+	// 转换为强度值
+	newStrength := int(newPos / microsecondsPerUnit)
+
+	// 钳制到有效范围 [0, maxLimit]
 	if newStrength < 0 {
 		newStrength = 0
 	}
 	if newStrength > maxLimit {
 		newStrength = maxLimit
 	}
+
+	// 无实际位置变更时跳过更新，避免不必要的通信
+	if newStrength == currentStrength {
+		return nil
+	}
+
+	log.Printf("[MPRIS] Seek(%d) → pos:%d str:%d (Channel %d)", offset, newPos, newStrength, m.channelId)
+
 	sendStrengthLocked(2, m.channelId, newStrength)
+
+	// 发射 Seeked 信号以通知外部客户端（如 KDE Plasma）位置已变更
+	// 仅对当前通道的 D-Bus 连接发射信号
+	newPosMicroseconds := int64(newStrength) * microsecondsPerUnit
+	if m.channelId == 1 {
+		emitPositionChanged(state.dbusConnA, newPosMicroseconds)
+	} else {
+		emitPositionChanged(state.dbusConnB, newPosMicroseconds)
+	}
+
 	return nil
 }
 
@@ -550,11 +657,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		state.mu.Unlock()
 		log.Println("[WS] ⚠️ APP 连接已断开")
-		// TUI will handle displaying this message
-		// fmt.Println("\n╔═══════════════════════════════════════════╗")
-		// fmt.Println("║       ⚠️  APP 连接已断开！               ║")
-		// fmt.Println("╚═══════════════════════════════════════════╝")
-		// os.Exit(0) // Do not exit, let TUI handle it
+		// 通知 TUI 显示二维码（使用 select 防止通道关闭后 panic）
+		select {
+		case qrDisconnectedCh <- struct{}{}:
+		default:
+		}
 	}()
 
 	// 消息循环
@@ -606,7 +713,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				// fmt.Println("╚═══════════════════════════════════════════╝")
 
 				// 启动心跳
-				go startHeartbeat(conn, appID)
+				go startHeartbeat(conn, appID, quitCh)
 
 				// 通知主 goroutine
 				select {
@@ -638,42 +745,56 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// startHeartbeat 定期向 APP 发送心跳
-func startHeartbeat(conn *websocket.Conn, appID string) {
+// startHeartbeat 定期向 APP 发送心跳（支持通过 quitCh 优雅停止）
+func startHeartbeat(conn *websocket.Conn, appID string, quitCh <-chan struct{}) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		state.mu.Lock()
-		if state.appConn != conn {
+	for {
+		select {
+		case <-quitCh:
+			log.Println("[WS] 心跳已停止")
+			return
+		case <-ticker.C:
+			state.mu.Lock()
+			if state.appConn != conn {
+				state.mu.Unlock()
+				return
+			}
 			state.mu.Unlock()
-			return
-		}
-		state.mu.Unlock()
 
-		hb := WsMessage{
-			Type:     "heartbeat",
-			ClientID: state.clientID,
-			TargetID: state.targetID,
-			Message:  "heartbeat",
-		}
-		data, _ := json.Marshal(hb)
-		if err := writeToApp(data); err != nil {
-			log.Printf("[WS] 发送心跳失败: %v\n", err)
-			return
+			hb := WsMessage{
+				Type:     "heartbeat",
+				ClientID: state.clientID,
+				TargetID: state.targetID,
+				Message:  "heartbeat",
+			}
+			data, _ := json.Marshal(hb)
+			if err := writeToApp(data); err != nil {
+				log.Printf("[WS] 发送心跳失败: %v\n", err)
+				return
+			}
 		}
 	}
 }
 
-func waveLoopA() {
+// waveLoop 波形循环 goroutine（统一实现，支持优雅停止）
+func waveLoop(channelName string, getWaveIdx func() int, quitCh <-chan struct{}) {
 	lastIdx := -1
 	for {
+		select {
+		case <-quitCh:
+			log.Printf("[WS] 波形循环 %s 已停止\n", channelName)
+			return
+		default:
+		}
+
 		state.mu.Lock()
-		idx := state.waveIdxA
+		idx := getWaveIdx()
 		state.mu.Unlock()
 
 		if idx != lastIdx {
-			sendClear("A")
+			sendClear(channelName)
 			lastIdx = idx
 			state.mu.Lock()
 			updateMetadataLocked()
@@ -683,7 +804,7 @@ func waveLoopA() {
 
 		if idx >= 0 && idx < len(waveData) {
 			waveStr := waveData[idx]
-			sendPulse("A", waveStr)
+			sendPulse(channelName, waveStr)
 
 			elements := strings.Count(waveStr, ",") + 1
 			duration := elements * 100
@@ -694,52 +815,13 @@ func waveLoopA() {
 
 			// 拆分 sleep，以便能更快响应波形切换
 			for i := 0; i < sleepTime; i += 100 {
-				time.Sleep(100 * time.Millisecond)
-				state.mu.Lock()
-				newIdx := state.waveIdxA
-				state.mu.Unlock()
-				if newIdx != idx {
-					break
+				select {
+				case <-quitCh:
+					return
+				case <-time.After(100 * time.Millisecond):
 				}
-			}
-		} else {
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
-}
-
-func waveLoopB() {
-	lastIdx := -1
-	for {
-		state.mu.Lock()
-		idx := state.waveIdxB
-		state.mu.Unlock()
-
-		if idx != lastIdx {
-			sendClear("B")
-			lastIdx = idx
-			state.mu.Lock()
-			updateMetadataLocked()
-			state.mu.Unlock()
-			time.Sleep(150 * time.Millisecond) // 发送 clear 后稍作延迟
-		}
-
-		if idx >= 0 && idx < len(waveData) {
-			waveStr := waveData[idx]
-			sendPulse("B", waveStr)
-
-			elements := strings.Count(waveStr, ",") + 1
-			duration := elements * 100
-			sleepTime := duration - 150
-			if sleepTime < 100 {
-				sleepTime = 100
-			}
-
-			// 拆分 sleep，以便能更快响应波形切换
-			for i := 0; i < sleepTime; i += 100 {
-				time.Sleep(100 * time.Millisecond)
 				state.mu.Lock()
-				newIdx := state.waveIdxB
+				newIdx := getWaveIdx()
 				state.mu.Unlock()
 				if newIdx != idx {
 					break
@@ -782,18 +864,25 @@ func handleAppMsg(msg WsMessage) {
 				// “设置上限后手动设置一次进度”
 				// 注意：在 KDE Plasma 中，一旦发出 Metadata 改变事件 (如波形名改变或长度改变)，
 				// KDE 会认为换歌了，并且将进度强制归零！
-				// 因此我们必须先触发 Metadata 更新，再发射 DBus 进度设置信号！
+				// 因此我们必须先将 Position 属性的值更新到正确值，再触发 Metadata 更新！
+				// 这样当 KDE 在 Metadata 改变后立即查询 Position 时，能读到正确值而非 0。
+				var posA, posB int64
+				if state.propsA != nil {
+					posA = int64(a) * 1000000
+					state.propsA.SetMust("org.mpris.MediaPlayer2.Player", "Position", dbus.MakeVariant(posA))
+				}
+				if state.propsB != nil {
+					posB = int64(b) * 1000000
+					state.propsB.SetMust("org.mpris.MediaPlayer2.Player", "Position", dbus.MakeVariant(posB))
+				}
 				if needMetaUpdate {
 					updateMetadataLocked()
 				}
+				// Metadata 更新完成后，发射 Seeked 信号通知 KDE 位置已变更
 				if state.propsA != nil {
-					posA := int64(a) * 1000000
-					state.propsA.SetMust("org.mpris.MediaPlayer2.Player", "Position", dbus.MakeVariant(posA))
 					emitPositionChanged(state.dbusConnA, posA)
 				}
 				if state.propsB != nil {
-					posB := int64(b) * 1000000
-					state.propsB.SetMust("org.mpris.MediaPlayer2.Player", "Position", dbus.MakeVariant(posB))
 					emitPositionChanged(state.dbusConnB, posB)
 				}
 			}
@@ -946,9 +1035,25 @@ func main() {
 		log.SetOutput(io.Discard)
 	}
 
+	// 加载配置文件（如果存在）
+	cfg, err := LoadConfig()
+	if err != nil {
+		log.Printf("[配置] 加载配置失败: %v，使用默认配置\n", err)
+	}
+
 	port := flag.Int("port", 9999, "WebSocket 服务监听端口")
 	host := flag.String("host", "", "QR 码中使用的主机地址 (默认自动检测局域网 IP)")
 	flag.Parse()
+
+	// 命令行参数优先于配置文件
+	if cfg != nil {
+		if *host == "" && cfg.Host != "" {
+			*host = cfg.Host
+		}
+		if *port == 9999 && cfg.Port != 9999 {
+			*port = cfg.Port
+		}
+	}
 
 	// 生成本机 clientId
 	state.clientID = generateID()
@@ -957,49 +1062,60 @@ func main() {
 	state.maxA = 200 // 默认上限，连上后会自动更新
 	state.maxB = 200 // 默认上限，连上后会自动更新
 
-	// 启动后台波形流式循环
-	go waveLoopA()
-	go waveLoopB()
-
-	reader := bufio.NewReader(os.Stdin)
+	// 启动后台波形流式循环（支持通过 quitCh 优雅停止）
+	go waveLoop("A", func() int { return state.waveIdxA }, quitCh)
+	go waveLoop("B", func() int { return state.waveIdxB }, quitCh)
 
 	// 确定绑定地址
 	bindAddr := *host
 	if bindAddr == "" {
-		bindAddr = selectBindAddress(reader)
+		addrs := getLocalAddresses()
+		if len(addrs) == 0 {
+			fmt.Println("  ⚠️ 未检测到可用网络接口，使用 0.0.0.0")
+			bindAddr = "0.0.0.0"
+		} else {
+			// 先用简单 TUI 选择地址
+			bindAddr = selectAddressOnlyTUI(addrs, *port, state.clientID)
+			if bindAddr == "" {
+				log.Println("未选择地址，退出")
+				os.Exit(0)
+			}
+		}
 	}
 
-	// QR 码中使用的地址（如果绑定 0.0.0.0 则用第一个 LAN IP）
+	// 计算 qrHost（无论地址是来自参数还是选择）
+	addrs := getLocalAddresses()
 	qrHost := bindAddr
-	if qrHost == "0.0.0.0" {
-		addrs := getLocalAddresses()
+	if bindAddr == "0.0.0.0" {
 		for _, a := range addrs {
 			if a.IP != "127.0.0.1" {
 				qrHost = a.IP
 				break
 			}
 		}
-		if qrHost == "0.0.0.0" {
+		if qrHost == "0.0.0.0" || qrHost == "" {
 			qrHost = "localhost"
 		}
 	}
+	// 使用完整 TUI 显示二维码并等待连接
+	if selectBindAddressTUI(bindAddr, *port, state.clientID) {
+		log.Println("用户退出 TUI，退出程序")
+		os.Exit(0)
+	}
 
+	// TUI 已退出，设置监听地址并继续主程序
 	listenAddr := fmt.Sprintf("%s:%d", bindAddr, *port)
 	state.listenAddr = listenAddr
-	wsAddr := fmt.Sprintf("ws://%s:%d/", qrHost, *port)
+	wsAddrForDisplay := fmt.Sprintf("ws://%s:%d/", qrHost, *port)
 
+	// 重置终端状态（清除 TUI 残留的屏幕状态）
+	fmt.Print("\033[2J\033[H")
 	fmt.Printf("  监听地址: %s\n", listenAddr)
-	fmt.Printf("  WS 地址:  %s\n\n", wsAddr)
+	fmt.Printf("  WS 地址:  %s\n\n", wsAddrForDisplay)
 
 	// 生成二维码
-	qrContent := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#%s%s", wsAddr, state.clientID)
+	qrContent := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#%s%s", wsAddrForDisplay, state.clientID)
 
-	fmt.Println("╔═══════════════════════════════════════════╗")
-	fmt.Println("║  请使用 DG-LAB APP 扫描以下二维码连接：  ║")
-	fmt.Println("╚═══════════════════════════════════════════╝")
-	fmt.Println()
-	qrterminal.GenerateHalfBlock(qrContent, qrterminal.L, os.Stdout)
-	fmt.Printf("\n  QR 内容: %s\n\n", qrContent)
 	fmt.Println("  等待 APP 扫码连接...")
 
 	// 启动 WebSocket 服务
@@ -1037,13 +1153,16 @@ func main() {
 	state.mu.Unlock()
 
 	// 启动 TUI 界面
-	p := tea.NewProgram(AppModel{})
+	p := tea.NewProgram(NewAppModel(qrContent, qrDisconnectedCh))
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("启动 UI 失败: %v\n", err)
 		os.Exit(1)
 	}
 
 	log.Println("\n正在退出...")
+	// 通知后台 goroutine 优雅停止
+	close(quitCh)
+
 	state.mu.Lock()
 	if state.appConn != nil {
 		// 安全归零

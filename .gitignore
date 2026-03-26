@@ -1,4 +1,12 @@
+# Build artifacts
+bin/
 dglab-mpris
+dglab-MPRIS
 dglab-mpris.log
+
+# User configuration (don't commit)
+config.yaml
+
+# Reference directory
 dglab-socketv2
 
