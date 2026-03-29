@@ -36,8 +36,8 @@ type WsMessage struct {
 	ClientID string      `json:"clientId"`
 	TargetID string      `json:"targetId"`
 	Message  string      `json:"message"`
-	Channel  int         `json:"channel,omitempty"`   // 强度通道 (1=A, 2=B)
-	Strength int         `json:"strength,omitempty"`  // 强度值
+	Channel  int         `json:"channel,omitempty"`  // 强度通道 (1=A, 2=B)
+	Strength int         `json:"strength,omitempty"` // 强度值
 	Time     int         `json:"time,omitempty"`
 }
 
@@ -79,12 +79,12 @@ type AppState struct {
 	mu         sync.Mutex
 	appWriteMu sync.Mutex // 保护 appConn 写操作
 
-	appConn  *websocket.Conn // APP 端的 WebSocket 连接
+	appConn    *websocket.Conn // APP 端的 WebSocket 连接
 	clientID   string          // 我们自己的 ID
 	targetID   string          // APP 端 ID
 	listenAddr string          // 服务监听地址
 
-	strengthA int // A 通道当前强度
+	strengthA     int // A 通道当前强度
 	strengthB     int // B 通道当前强度
 	maxA          int // A 通道硬上限
 	maxB          int // B 通道硬上限
@@ -107,21 +107,19 @@ var (
 	state    = &AppState{}
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			// 仅允许同源或空 origin（移动端 APP 直接连接无 browser context）
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return true
-			}
-			// 允许同源请求
-			if origin == "null" || strings.HasPrefix(origin, "file://") {
-				return true
-			}
-			return false
+			// 放行所有 origin（DG-LAB APP 可能发送任意 Origin 头）
+			return true
 		},
 	}
-	boundCh           = make(chan struct{}, 1)
-	quitCh            = make(chan struct{}) // 用于优雅停止后台 goroutine
-	qrDisconnectedCh  = make(chan struct{}) // 通知 TUI 显示二维码
+	boundCh          = make(chan struct{}, 1)
+	quitCh           = make(chan struct{}) // 用于优雅停止后台 goroutine
+	qrDisconnectedCh = make(chan struct{}) // 通知 TUI 显示二维码控制器
+)
+
+// 波形循环常量
+const (
+	waveClearDelay = 150 * time.Millisecond // 发送 clear 后延迟
+	waveStepDelay  = 100 * time.Millisecond // 步进延迟
 )
 
 // ============================================================
@@ -249,8 +247,17 @@ func selectAddressOnlyTUI(addrs []ifaceAddr, port int, clientID string) string {
 
 	go func() {
 		defer close(doneCh)
-		if _, err := p.Run(); err != nil {
-			log.Printf("启动 TUI 失败: %v\n", err)
+		var tuiErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					tuiErr = fmt.Errorf("TUI panic: %v", r)
+				}
+			}()
+			_, tuiErr = p.Run()
+		}()
+		if tuiErr != nil {
+			log.Printf("启动 TUI 失败: %v，使用终端模式\n", tuiErr)
 		}
 		resetTerminal()
 	}()
@@ -262,6 +269,20 @@ func selectAddressOnlyTUI(addrs []ifaceAddr, port int, clientID string) string {
 		result = ""
 	}
 
+	if result == "" && len(addrs) > 0 {
+		for _, a := range addrs {
+			if a.IP != "127.0.0.1" {
+				result = a.IP
+				log.Printf("[终端模式] 自动选择地址: %s\n", result)
+				break
+			}
+		}
+		if result == "" {
+			result = addrs[0].IP
+			log.Printf("[终端模式] 自动选择地址: %s\n", result)
+		}
+	}
+
 	return result
 }
 
@@ -271,11 +292,119 @@ func selectBindAddressTUI(bindAddr string, port int, clientID string) bool {
 	model := NewSelectAddressModel(getLocalAddresses(), nil, port, clientID)
 
 	p := tea.NewProgram(model)
-	if _, err := p.Run(); err != nil {
-		log.Printf("启动 TUI 失败: %v\n", err)
+
+	var tuiErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				tuiErr = fmt.Errorf("TUI panic: %v", r)
+			}
+		}()
+		_, tuiErr = p.Run()
+	}()
+
+	if tuiErr != nil {
+		log.Printf("[终端模式] 启动 TUI 失败: %v，进入纯终端模式\n", tuiErr)
+		resetTerminal()
+
+		addrs := getLocalAddresses()
+		qrHost := bindAddr
+		if bindAddr == "0.0.0.0" {
+			for _, a := range addrs {
+				if a.IP != "127.0.0.1" {
+					qrHost = a.IP
+					break
+				}
+			}
+			if qrHost == "0.0.0.0" || qrHost == "" {
+				qrHost = "localhost"
+			}
+		}
+		wsAddr := fmt.Sprintf("ws://%s:%d/", qrHost, port)
+		qrURL := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#%s%s", wsAddr, clientID)
+
+		fmt.Print("\033[2J\033[H")
+		fmt.Printf("  监听地址: %s:%d\n", bindAddr, port)
+		fmt.Printf("  WS 地址:  %s\n\n", wsAddr)
+		fmt.Println("  请用 DG-LAB APP 扫码连接（URL 如下）：")
+		fmt.Println()
+		fmt.Println("  " + qrURL)
+		fmt.Println()
+		fmt.Println("  等待 APP 扫码连接...")
+
+		log.Printf("[终端模式] 二维码 URL: %s\n", qrURL)
+		log.Println("[终端模式] 等待 APP 连接...")
+
+		<-boundCh
+		fmt.Println("  APP 已连接，正在注册 MPRIS...")
+
+		var propsA *prop.Properties
+		var connA *dbus.Conn
+		var propsB *prop.Properties
+		var connB *dbus.Conn
+		var err error
+		propsA, connA, err = registerMPRISChannel("A", 1, "DG-LAB A通道")
+		if err != nil {
+			log.Fatalf("[MPRIS] A 通道注册失败: %v\n", err)
+		}
+		propsB, connB, err = registerMPRISChannel("B", 2, "DG-LAB B通道")
+		if err != nil {
+			log.Fatalf("[MPRIS] B 通道注册失败: %v\n", err)
+		}
+		state.mu.Lock()
+		state.propsA = propsA
+		state.propsB = propsB
+		state.dbusConnA = connA
+		state.dbusConnB = connB
+		state.mprisReady = true
+		state.mu.Unlock()
+
+		fmt.Println("  MPRIS 注册完成，进入操作界面...")
+		time.Sleep(1 * time.Second)
+
+		p = tea.NewProgram(NewAppModel(qrURL, qrDisconnectedCh))
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("  操作界面退出: %v\n", err)
+		}
+		return true
 	}
+
 	resetTerminal()
-	return model.shouldQuit
+	qrURL := model.qrContent
+
+	log.Println("[TUI] 等待 APP 连接...")
+	<-boundCh
+	fmt.Println("  APP 已连接，正在注册 MPRIS...")
+
+	var tpropsA *prop.Properties
+	var tconnA *dbus.Conn
+	var tpropsB *prop.Properties
+	var tconnB *dbus.Conn
+	var err error
+	tpropsA, tconnA, err = registerMPRISChannel("A", 1, "DG-LAB A通道")
+	if err != nil {
+		log.Fatalf("[MPRIS] A 通道注册失败: %v\n", err)
+	}
+	tpropsB, tconnB, err = registerMPRISChannel("B", 2, "DG-LAB B通道")
+	if err != nil {
+		log.Fatalf("[MPRIS] B 通道注册失败: %v\n", err)
+	}
+	state.mu.Lock()
+	state.propsA = tpropsA
+	state.propsB = tpropsB
+	state.dbusConnA = tconnA
+	state.dbusConnB = tconnB
+	state.mprisReady = true
+	state.mu.Unlock()
+
+	fmt.Println("  MPRIS 注册完成，进入操作界面...")
+	time.Sleep(1 * time.Second)
+
+	p = tea.NewProgram(NewAppModel(qrURL, qrDisconnectedCh))
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("  操作界面退出: %v\n", err)
+	}
+	return true
 }
 
 // writeToApp 线程安全地向 APP 发送消息
@@ -567,16 +696,22 @@ func sendClear(channel string) {
 	if channel == "B" {
 		chNum = "2"
 	}
-	
+
 	msg := WsMsgPayload{
 		Type:     "msg",
 		ClientID: state.clientID,
 		TargetID: state.targetID,
 		Message:  "clear-" + chNum,
 	}
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("[WS] 序列化消息失败: %v\n", err)
+		return
+	}
 	log.Printf("[WS] 正在下发指令至硬件 APP: %s", string(data))
-	writeToApp(data)
+	if err := writeToApp(data); err != nil {
+		log.Printf("[WS] 发送清除消息失败: %v\n", err)
+	}
 }
 
 // sendPulse 发送波形控制消息（需在未锁定时调用）
@@ -613,6 +748,17 @@ func sendPulse(channelName string, waveDataStr string) {
 
 // wsHandler 处理来自 APP 的 WebSocket 连接
 func wsHandler(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] wsHandler panic: %v\n", r)
+		}
+	}()
+
+	origin := r.Header.Get("Origin")
+	originResult := origin == "" || origin == "null" || strings.HasPrefix(origin, "file://")
+	log.Printf("[WS] 收到请求: RemoteAddr=%s Host=%s Origin=%s URL=%s CheckOrigin结果=%v\n",
+		r.RemoteAddr, r.Host, origin, r.URL.String(), originResult)
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[WS] 升级连接失败: %v\n", err)
@@ -639,7 +785,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		TargetID: appID,          // 刚刚自动分配的 APP 的 ID
 		Message:  "targetId",
 	}
-	data, _ := json.Marshal(bindMsg)
+	data, err := json.Marshal(bindMsg)
+	if err != nil {
+		log.Printf("[WS] 序列化 bind 消息失败: %v\n", err)
+		conn.Close()
+		return
+	}
 	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		log.Printf("[WS] 发送 bind 消息失败: %v\n", err)
 		conn.Close()
@@ -672,6 +823,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		log.Printf("[WS] 收到原始消息: %s\n", string(rawMsg))
+
 		var msg WsMessage
 		if err := json.Unmarshal(rawMsg, &msg); err != nil {
 			log.Printf("[WS] 解析消息失败: %s\n", string(rawMsg))
@@ -679,11 +832,15 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		msgType := fmt.Sprintf("%v", msg.Type)
+		log.Printf("[WS] 消息解析: Type=%s ClientID=%s TargetID=%s Message=%s\n",
+			msgType, msg.ClientID, msg.TargetID, msg.Message)
 
 		switch msgType {
 		case "bind":
 			state.mu.Lock()
 			// APP 可能将 TargetID 设置为我们在 QR 码中的 state.clientID，或者我们在上方刚分配并下发的 appID
+			log.Printf("[WS] bind 处理: 收到 TargetID=%s 我们的 clientID=%s 分配的 appID=%s\n",
+				msg.TargetID, state.clientID, appID)
 			if msg.TargetID == state.clientID || msg.TargetID == appID {
 				// 获取 APP 的真实 ID (它在 clientId 字段中发给我们)
 				appRealID := msg.ClientID
@@ -703,8 +860,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					TargetID: state.targetID,
 					Message:  "200",
 				}
-				d, _ := json.Marshal(confirmMsg)
-				writeToApp(d)
+				d, err := json.Marshal(confirmMsg)
+				if err != nil {
+					log.Printf("[WS] 序列化绑定确认消息失败: %v\n", err)
+				} else {
+					writeToApp(d)
+				}
 
 				log.Printf("[WS] ✅ 配对成功！APP ID: %s\n", state.targetID)
 				// TUI will handle displaying this message
@@ -718,11 +879,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				// 通知主 goroutine
 				select {
 				case boundCh <- struct{}{}:
+					log.Printf("[WS] boundCh 已发送！\n")
 				default:
+					log.Printf("[WS] boundCh 发送失败 (可能已满)\n")
 				}
 			} else {
 				state.mu.Unlock()
-				log.Printf("[WS] 绑定目标不匹配: got=%s, want=%s\n", msg.TargetID, state.clientID)
+				log.Printf("[WS] 绑定目标不匹配: got=%s, want=%s 或 %s\n", msg.TargetID, state.clientID, appID)
 			}
 
 		case "msg":
@@ -769,7 +932,11 @@ func startHeartbeat(conn *websocket.Conn, appID string, quitCh <-chan struct{}) 
 				TargetID: state.targetID,
 				Message:  "heartbeat",
 			}
-			data, _ := json.Marshal(hb)
+			data, err := json.Marshal(hb)
+			if err != nil {
+				log.Printf("[WS] 序列化心跳消息失败: %v\n", err)
+				return
+			}
 			if err := writeToApp(data); err != nil {
 				log.Printf("[WS] 发送心跳失败: %v\n", err)
 				return
@@ -799,7 +966,7 @@ func waveLoop(channelName string, getWaveIdx func() int, quitCh <-chan struct{})
 			state.mu.Lock()
 			updateMetadataLocked()
 			state.mu.Unlock()
-			time.Sleep(150 * time.Millisecond) // 发送 clear 后稍作延迟，防止指令冲撞
+			time.Sleep(waveClearDelay) // 使用常量
 		}
 
 		if idx >= 0 && idx < len(waveData) {
@@ -808,7 +975,7 @@ func waveLoop(channelName string, getWaveIdx func() int, quitCh <-chan struct{})
 
 			elements := strings.Count(waveStr, ",") + 1
 			duration := elements * 100
-			sleepTime := duration - 150
+			sleepTime := duration - int(waveClearDelay.Milliseconds())
 			if sleepTime < 100 {
 				sleepTime = 100
 			}
@@ -818,7 +985,7 @@ func waveLoop(channelName string, getWaveIdx func() int, quitCh <-chan struct{})
 				select {
 				case <-quitCh:
 					return
-				case <-time.After(100 * time.Millisecond):
+				case <-time.After(waveStepDelay):
 				}
 				state.mu.Lock()
 				newIdx := getWaveIdx()
@@ -1007,15 +1174,18 @@ func registerMPRISChannel(channelName string, channelId int, identity string) (*
 
 	props, err := prop.Export(conn, "/org/mpris/MediaPlayer2", propsSpec)
 	if err != nil {
+		conn.Close() // 失败时关闭连接
 		return nil, nil, fmt.Errorf("导出 MPRIS 属性失败: %w", err)
 	}
 
 	busName := fmt.Sprintf("org.mpris.MediaPlayer2.DGLab_%s", channelName)
 	reply, err := conn.RequestName(busName, dbus.NameFlagReplaceExisting)
 	if err != nil {
+		conn.Close() // 失败时关闭连接
 		return nil, nil, fmt.Errorf("请求 D-Bus 名称失败: %w", err)
 	}
 	if reply != dbus.RequestNameReplyPrimaryOwner {
+		conn.Close() // 失败时关闭连接
 		return nil, nil, fmt.Errorf("未能获取 D-Bus 名称所有权: %s", busName)
 	}
 
@@ -1097,66 +1267,26 @@ func main() {
 			qrHost = "localhost"
 		}
 	}
-	// 使用完整 TUI 显示二维码并等待连接
-	if selectBindAddressTUI(bindAddr, *port, state.clientID) {
-		log.Println("用户退出 TUI，退出程序")
-		os.Exit(0)
-	}
-
-	// TUI 已退出，设置监听地址并继续主程序
 	listenAddr := fmt.Sprintf("%s:%d", bindAddr, *port)
 	state.listenAddr = listenAddr
-	wsAddrForDisplay := fmt.Sprintf("ws://%s:%d/", qrHost, *port)
 
-	// 重置终端状态（清除 TUI 残留的屏幕状态）
-	fmt.Print("\033[2J\033[H")
-	fmt.Printf("  监听地址: %s\n", listenAddr)
-	fmt.Printf("  WS 地址:  %s\n\n", wsAddrForDisplay)
-
-	// 生成二维码
-	qrContent := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#%s%s", wsAddrForDisplay, state.clientID)
-
-	fmt.Println("  等待 APP 扫码连接...")
-
-	// 启动 WebSocket 服务
 	http.HandleFunc("/", wsHandler)
+
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalf("[WS] 绑定端口失败: %v\n", err)
+	}
+	log.Printf("[WS] 正在监听 %s ...\n", listenAddr)
+
 	go func() {
-		log.Printf("[WS] 正在监听 %s ...\n", listenAddr)
-		if err := http.ListenAndServe(listenAddr, nil); err != nil {
-			log.Fatalf("[WS] 启动服务失败: %v\n", err)
+		if err := http.Serve(listener, nil); err != nil {
+			log.Printf("[WS] 服务器异常: %v\n", err)
 		}
 	}()
 
-	// 等待配对完成
-	<-boundCh
-	fmt.Println()
-
-
-
-	// 注册 MPRIS A 通道
-	propsA, connA, err := registerMPRISChannel("A", 1, "DG-LAB A通道")
-	if err != nil {
-		log.Fatalf("[MPRIS] A 通道注册失败: %v\n", err)
-	}
-	// 注册 MPRIS B 通道
-	propsB, connB, err := registerMPRISChannel("B", 2, "DG-LAB B通道")
-	if err != nil {
-		log.Fatalf("[MPRIS] B 通道注册失败: %v\n", err)
-	}
-
-	state.mu.Lock()
-	state.propsA = propsA
-	state.propsB = propsB
-	state.dbusConnA = connA
-	state.dbusConnB = connB
-	state.mprisReady = true
-	state.mu.Unlock()
-
-	// 启动 TUI 界面
-	p := tea.NewProgram(NewAppModel(qrContent, qrDisconnectedCh))
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("启动 UI 失败: %v\n", err)
-		os.Exit(1)
+	tuiQuit := selectBindAddressTUI(bindAddr, *port, state.clientID)
+	if tuiQuit {
+		log.Println("用户退出 TUI")
 	}
 
 	log.Println("\n正在退出...")
