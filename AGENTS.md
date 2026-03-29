@@ -208,4 +208,4 @@ defer state.mu.Unlock()
 - Binary output: `./bin/dglab-mpris`
 - Log file: `dglab-mpris.log` (created in working directory)
 - Config file: `config.yaml` (same directory as binary)
-- QR code images saved as `qr_<host>:<port>.png`
+- QR code images saved as `qrcode.png`

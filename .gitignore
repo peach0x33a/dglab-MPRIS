@@ -7,6 +7,9 @@ dglab-mpris.log
 # User configuration (don't commit)
 config.yaml
 
+# Runtime artifacts
+qrcode.png
+
 # Reference directory
 dglab-socketv2
 

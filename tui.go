@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -36,30 +35,47 @@ func tick() tea.Cmd {
 	})
 }
 
+// pairedMsg 表示配对成功
+type pairedMsg struct{}
+
+func waitForPairing(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		<-ch
+		return pairedMsg{}
+	}
+}
+
+func waitForDisconnect(ch <-chan struct{}) tea.Cmd {
+	return func() tea.Msg {
+		<-ch
+		return qrDisconnectedMsg{}
+	}
+}
+
 // SelectAddressModel 地址选择模型
 type SelectAddressModel struct {
-	addresses   []ifaceAddr
-	selected    int
-	quitCh      chan<- string
-	resultCh    <-chan string
-	currentView string // "select" 或 "qr"
-	qrContent   string
-	wsAddr      string
-	port        int
-	clientID    string
-	shouldQuit  bool // 标记是否应该退出（用于 nil quitCh 场景）
+	addresses        []ifaceAddr
+	selected         int
+	addrCh           chan<- string // 用于通知 main.go 启动服务器
+	currentView      string        // "select" 或 "qr"
+	qrContent        string
+	qrURL            string
+	wsAddr           string
+	port             int
+	clientID         string
+	qrDisconnectedCh chan struct{} // 传递给 AppModel
 }
 
 // NewSelectAddressModel 创建地址选择模型
-func NewSelectAddressModel(addrs []ifaceAddr, quitCh chan<- string, port int, clientID string) *SelectAddressModel {
+func NewSelectAddressModel(addrs []ifaceAddr, addrCh chan<- string, port int, clientID string, qrDisconnectedCh chan struct{}) *SelectAddressModel {
 	return &SelectAddressModel{
-		addresses:   addrs,
-		selected:    0,
-		quitCh:      quitCh,
-		currentView: "select",
-		port:        port,
-		clientID:    clientID,
-		shouldQuit:  false,
+		addresses:        addrs,
+		selected:         0,
+		addrCh:           addrCh,
+		currentView:      "select",
+		port:             port,
+		clientID:         clientID,
+		qrDisconnectedCh: qrDisconnectedCh,
 	}
 }
 
@@ -70,6 +86,11 @@ func (m *SelectAddressModel) Init() tea.Cmd {
 func (m *SelectAddressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		}
+
 		if m.currentView == "select" {
 			switch msg.String() {
 			case "up", "k":
@@ -95,39 +116,32 @@ func (m *SelectAddressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.wsAddr = fmt.Sprintf("%s:%d", selected, m.port)
-				qrURL := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#ws://%s:%d/%s", qrHost, m.port, m.clientID)
+				// 恢复 QR URL: 包含 path 中的 clientID
+				m.qrURL = fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#ws://%s:%d/%s", qrHost, m.port, m.clientID)
+
 				var buf bytes.Buffer
-				qrterminal.GenerateHalfBlock(qrURL, qrterminal.L, &buf)
+				qrterminal.GenerateHalfBlock(m.qrURL, qrterminal.L, &buf)
 				m.qrContent = buf.String()
-				// 保存二维码图片到当前目录
-				qrFilename := fmt.Sprintf("qr_%s:%d.png", selected, m.port)
-				if err := qrcode.WriteFile(qrURL, qrcode.Medium, 256, qrFilename); err != nil {
-					log.Printf("保存二维码图片失败: %v", err)
-				} else {
-					log.Printf("二维码已保存: %s", qrFilename)
-				}
+
+				// 保存二维码图片
+				qrFilename := "qrcode.png"
+				_ = qrcode.WriteFile(m.qrURL, qrcode.Medium, 256, qrFilename)
+
 				m.currentView = "qr"
-			case "ctrl+c", "q":
-				if m.quitCh != nil {
-					m.quitCh <- ""
-				} else {
-					m.shouldQuit = true
+
+				// 通知 main.go 启动服务器
+				if m.addrCh != nil {
+					m.addrCh <- selected
 				}
-				return m, tea.Quit
-			}
-		} else if m.currentView == "qr" {
-			switch msg.String() {
-			case "enter":
-				// 忽略，不要退出
-			case "ctrl+c", "q":
-				if m.quitCh != nil {
-					m.quitCh <- ""
-				} else {
-					m.shouldQuit = true
-				}
-				return m, tea.Quit
+
+				// 开始等待配对成功的信号
+				return m, waitForPairing(boundCh)
 			}
 		}
+	case pairedMsg:
+		// 配对成功，切换到主应用界面
+		appModel := NewAppModel(m.qrContent, m.qrDisconnectedCh, m)
+		return appModel, appModel.Init()
 	}
 	return m, nil
 }
@@ -135,8 +149,6 @@ func (m *SelectAddressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *SelectAddressModel) getSelectedAddress() string {
 	if m.selected < len(m.addresses) {
 		return m.addresses[m.selected].IP
-	} else if m.selected == len(m.addresses) {
-		return "0.0.0.0"
 	}
 	return "0.0.0.0"
 }
@@ -204,22 +216,27 @@ type qrDisconnectedMsg struct{}
 
 // AppModel 表示我们的 TUI 状态
 type AppModel struct {
-	qrContent        string        // 二维码内容
-	showQR           bool          // 是否显示二维码
-	qrDisconnectedCh chan struct{} // 接收连接断开通知（仅在 TUI 运行时有效）
+	qrContent        string              // 二维码内容
+	qrDisconnectedCh <-chan struct{}     // 接收连接断开通知
+	parentModel      *SelectAddressModel // 用于断开时返回上级模型
 }
 
 // NewAppModel 创建 TUI 模型
-func NewAppModel(qrContent string, qrDisconnectedCh chan struct{}) AppModel {
+func NewAppModel(qrContent string, qrDisconnectedCh <-chan struct{}, parent *SelectAddressModel) AppModel {
 	return AppModel{
 		qrContent:        qrContent,
-		showQR:           false,
 		qrDisconnectedCh: qrDisconnectedCh,
+		parentModel:      parent,
 	}
 }
 
 func (m AppModel) Init() tea.Cmd {
-	return tick()
+	var cmds []tea.Cmd
+	cmds = append(cmds, tick())
+	if m.qrDisconnectedCh != nil {
+		cmds = append(cmds, waitForDisconnect(m.qrDisconnectedCh))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -231,18 +248,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		return m, tick()
 	case qrDisconnectedMsg:
-		m.showQR = true
-		return m, tick()
-	}
-
-	// 检查连接断开通知（仅在通道可用时检查）
-	if m.qrDisconnectedCh != nil {
-		select {
-		case <-m.qrDisconnectedCh:
-			m.showQR = true
-			return m, tick()
-		default:
-		}
+		// 断开连接时，返回到父模型的二维码界面，并重新开始等待配对信号
+		m.parentModel.currentView = "qr"
+		return m.parentModel, tea.Batch(tick(), waitForPairing(boundCh))
 	}
 
 	return m, nil
@@ -279,20 +287,7 @@ func (m AppModel) View() string {
 	b.WriteString(titleStyle.Render("DG-LAB MPRIS 控制器 v2.0"))
 	b.WriteString("\n\n")
 
-	// 连接断开后显示二维码
-	if m.showQR && m.qrContent != "" {
-		b.WriteString(warningStyle.Render("⚠️ APP 连接已断开，正在等待重新连接...\n\n"))
-		b.WriteString(labelStyle.Render("请使用 DG-LAB APP 扫描以下二维码："))
-		b.WriteString("\n\n")
-		b.WriteString(m.qrContent)
-		b.WriteString("\n\n")
-		b.WriteString(labelStyle.Render("服务监听: "))
-		b.WriteString(valueStyle.Render("ws://" + listenAddr))
-		b.WriteString("\n\n")
-		b.WriteString(subStyle.Render("按 [q] 或 [ctrl+c] 退出"))
-		b.WriteString("\n")
-		return b.String()
-	}
+	// AppModel 仅用于已连接状态，断开时的二维码显示已交由 SelectAddressModel 处理
 
 	// 连接状态
 	b.WriteString(labelStyle.Render("服务监听: "))

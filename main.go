@@ -111,7 +111,8 @@ var (
 			return true
 		},
 	}
-	boundCh          = make(chan struct{}, 1)
+	boundCh          = make(chan struct{}) // 改为无缓冲，用于 close 广播
+	pairOnce         sync.Once             // 确保 boundCh 仅关闭一次
 	quitCh           = make(chan struct{}) // 用于优雅停止后台 goroutine
 	qrDisconnectedCh = make(chan struct{}) // 通知 TUI 显示二维码控制器
 )
@@ -235,177 +236,7 @@ func resetTerminal() {
 	}
 }
 
-// selectAddressOnlyTUI 仅用于地址选择，返回选中的地址
-func selectAddressOnlyTUI(addrs []ifaceAddr, port int, clientID string) string {
-	quitCh := make(chan string)
-	model := NewSelectAddressModel(addrs, quitCh, port, clientID)
-
-	p := tea.NewProgram(model)
-
-	doneCh := make(chan struct{})
-	var result string
-
-	go func() {
-		defer close(doneCh)
-		var tuiErr error
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					tuiErr = fmt.Errorf("TUI panic: %v", r)
-				}
-			}()
-			_, tuiErr = p.Run()
-		}()
-		if tuiErr != nil {
-			log.Printf("启动 TUI 失败: %v，使用终端模式\n", tuiErr)
-		}
-		resetTerminal()
-	}()
-
-	select {
-	case addr := <-quitCh:
-		result = addr
-	case <-doneCh:
-		result = ""
-	}
-
-	if result == "" && len(addrs) > 0 {
-		for _, a := range addrs {
-			if a.IP != "127.0.0.1" {
-				result = a.IP
-				log.Printf("[终端模式] 自动选择地址: %s\n", result)
-				break
-			}
-		}
-		if result == "" {
-			result = addrs[0].IP
-			log.Printf("[终端模式] 自动选择地址: %s\n", result)
-		}
-	}
-
-	return result
-}
-
-// selectBindAddressTUI 使用 TUI 交互式选择绑定地址并等待 APP 连接
-// 返回 true 如果用户选择退出，false 如果继续
-func selectBindAddressTUI(bindAddr string, port int, clientID string) bool {
-	model := NewSelectAddressModel(getLocalAddresses(), nil, port, clientID)
-
-	p := tea.NewProgram(model)
-
-	var tuiErr error
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				tuiErr = fmt.Errorf("TUI panic: %v", r)
-			}
-		}()
-		_, tuiErr = p.Run()
-	}()
-
-	if tuiErr != nil {
-		log.Printf("[终端模式] 启动 TUI 失败: %v，进入纯终端模式\n", tuiErr)
-		resetTerminal()
-
-		addrs := getLocalAddresses()
-		qrHost := bindAddr
-		if bindAddr == "0.0.0.0" {
-			for _, a := range addrs {
-				if a.IP != "127.0.0.1" {
-					qrHost = a.IP
-					break
-				}
-			}
-			if qrHost == "0.0.0.0" || qrHost == "" {
-				qrHost = "localhost"
-			}
-		}
-		wsAddr := fmt.Sprintf("ws://%s:%d/", qrHost, port)
-		qrURL := fmt.Sprintf("https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#%s%s", wsAddr, clientID)
-
-		fmt.Print("\033[2J\033[H")
-		fmt.Printf("  监听地址: %s:%d\n", bindAddr, port)
-		fmt.Printf("  WS 地址:  %s\n\n", wsAddr)
-		fmt.Println("  请用 DG-LAB APP 扫码连接（URL 如下）：")
-		fmt.Println()
-		fmt.Println("  " + qrURL)
-		fmt.Println()
-		fmt.Println("  等待 APP 扫码连接...")
-
-		log.Printf("[终端模式] 二维码 URL: %s\n", qrURL)
-		log.Println("[终端模式] 等待 APP 连接...")
-
-		<-boundCh
-		fmt.Println("  APP 已连接，正在注册 MPRIS...")
-
-		var propsA *prop.Properties
-		var connA *dbus.Conn
-		var propsB *prop.Properties
-		var connB *dbus.Conn
-		var err error
-		propsA, connA, err = registerMPRISChannel("A", 1, "DG-LAB A通道")
-		if err != nil {
-			log.Fatalf("[MPRIS] A 通道注册失败: %v\n", err)
-		}
-		propsB, connB, err = registerMPRISChannel("B", 2, "DG-LAB B通道")
-		if err != nil {
-			log.Fatalf("[MPRIS] B 通道注册失败: %v\n", err)
-		}
-		state.mu.Lock()
-		state.propsA = propsA
-		state.propsB = propsB
-		state.dbusConnA = connA
-		state.dbusConnB = connB
-		state.mprisReady = true
-		state.mu.Unlock()
-
-		fmt.Println("  MPRIS 注册完成，进入操作界面...")
-		time.Sleep(1 * time.Second)
-
-		p = tea.NewProgram(NewAppModel(qrURL, qrDisconnectedCh))
-		if _, err := p.Run(); err != nil {
-			fmt.Printf("  操作界面退出: %v\n", err)
-		}
-		return true
-	}
-
-	resetTerminal()
-	qrURL := model.qrContent
-
-	log.Println("[TUI] 等待 APP 连接...")
-	<-boundCh
-	fmt.Println("  APP 已连接，正在注册 MPRIS...")
-
-	var tpropsA *prop.Properties
-	var tconnA *dbus.Conn
-	var tpropsB *prop.Properties
-	var tconnB *dbus.Conn
-	var err error
-	tpropsA, tconnA, err = registerMPRISChannel("A", 1, "DG-LAB A通道")
-	if err != nil {
-		log.Fatalf("[MPRIS] A 通道注册失败: %v\n", err)
-	}
-	tpropsB, tconnB, err = registerMPRISChannel("B", 2, "DG-LAB B通道")
-	if err != nil {
-		log.Fatalf("[MPRIS] B 通道注册失败: %v\n", err)
-	}
-	state.mu.Lock()
-	state.propsA = tpropsA
-	state.propsB = tpropsB
-	state.dbusConnA = tconnA
-	state.dbusConnB = tconnB
-	state.mprisReady = true
-	state.mu.Unlock()
-
-	fmt.Println("  MPRIS 注册完成，进入操作界面...")
-	time.Sleep(1 * time.Second)
-
-	p = tea.NewProgram(NewAppModel(qrURL, qrDisconnectedCh))
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("  操作界面退出: %v\n", err)
-	}
-	return true
-}
+// selectAddressOnlyTUI 和 selectBindAddressTUI 被移除，改为单一 TUI 流程
 
 // writeToApp 线程安全地向 APP 发送消息
 func writeToApp(data []byte) error {
@@ -466,11 +297,12 @@ func (m *MprisPlayer) Play() *dbus.Error {
 
 	target := last
 	if target <= 0 {
-		target = 0
+		target = 10 // 如果之前从未产生过强度，默认给 10（用户能感知强度的底线），否则点 Play 键也没用
 	}
 	if target > maxLimit {
 		target = maxLimit
 	}
+
 	sendStrengthLocked(2, m.channelId, target)
 	updatePlaybackStatusLocked(m.channelId, "Playing")
 	return nil
@@ -491,18 +323,45 @@ func (m *MprisPlayer) Pause() *dbus.Error {
 			state.lastStrengthB = cur
 		}
 	}
+
 	sendStrengthLocked(2, m.channelId, 0)
+
+	// 发送 clear 清空 APP 端的波形队列
+	chName := "A"
+	if m.channelId == 2 {
+		chName = "B"
+	}
+	state.mu.Unlock()
+	sendClear(chName) // sendClear 内部加锁
+	state.mu.Lock()
+
 	updatePlaybackStatusLocked(m.channelId, "Paused")
 	return nil
 }
 
-func (m *MprisPlayer) PlayPause() *dbus.Error {
+func (m *MprisPlayer) getPlaybackStatus() string {
 	state.mu.Lock()
-	cur, _, _ := m.getStrengthAndMax()
-	isPlaying := cur > 0
-	state.mu.Unlock()
+	defer state.mu.Unlock()
+	status := "Paused"
+	var props *prop.Properties
+	if m.channelId == 1 {
+		props = state.propsA
+	} else {
+		props = state.propsB
+	}
+	if props != nil {
+		if val, err := props.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus"); err == nil {
+			if strVal, ok := val.Value().(string); ok {
+				status = strVal
+			}
+		}
+	}
+	return status
+}
 
-	if isPlaying {
+func (m *MprisPlayer) PlayPause() *dbus.Error {
+	status := m.getPlaybackStatus()
+	if status == "Playing" {
 		return m.Pause()
 	}
 	return m.Play()
@@ -514,7 +373,18 @@ func (m *MprisPlayer) Stop() *dbus.Error {
 	if !state.paired {
 		return nil
 	}
+
 	sendStrengthLocked(2, m.channelId, 0)
+
+	// 发送 clear
+	chName := "A"
+	if m.channelId == 2 {
+		chName = "B"
+	}
+	state.mu.Unlock()
+	sendClear(chName)
+	state.mu.Lock()
+
 	updatePlaybackStatusLocked(m.channelId, "Stopped")
 	return nil
 }
@@ -542,7 +412,28 @@ func setWaveIndex(channelId int, offset int) {
 		state.waveIdxB = idx
 	}
 
+	// 波形切换时，必须先更新 Position 属性值，再更新 Metadata
+	// 否则 KDE 在收到 Metadata 变更信号后立即 Get Position 时读到旧值（0）
+	currentStrength := state.strengthA
+	conn := state.dbusConnA
+	props := state.propsA
+	if channelId == 2 {
+		currentStrength = state.strengthB
+		conn = state.dbusConnB
+		props = state.propsB
+	}
+	pos := int64(currentStrength) * microsecondsPerUnit
+
+	// 1. 先更新 Position 属性存储值
+	if props != nil {
+		props.SetMust("org.mpris.MediaPlayer2.Player", "Position", dbus.MakeVariant(pos))
+	}
+
+	// 2. 再更新 Metadata（会触发 PropertiesChanged，KDE 此时 Get Position 能读到正确值）
 	updateMetadataLocked()
+
+	// 3. 最后发射 Seeked 信号
+	emitPositionChanged(conn, pos)
 }
 
 func (m *MprisPlayer) Next() *dbus.Error {
@@ -779,10 +670,12 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[WS] 新连接来自 %s，分配 APP ID: %s\n", r.RemoteAddr, appID)
 
 	// 发送 bind 消息，给客户发送自己的 ID 以绑定 (1:1 Node.js 逻辑)
+	// 发送初始绑定消息 (参照 dglab-socketv2)
+	// clientId 为刚分配给 APP 的 ID，targetId 为空
 	bindMsg := WsMessage{
 		Type:     "bind",
-		ClientID: state.clientID, // 前端 (Web) 的 ID
-		TargetID: appID,          // 刚刚自动分配的 APP 的 ID
+		ClientID: appID,
+		TargetID: "",
 		Message:  "targetId",
 	}
 	data, err := json.Marshal(bindMsg)
@@ -805,9 +698,33 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			state.paired = false
 			state.appConn = nil
 			state.targetID = ""
+
+			// 归零所有通道状态
+			state.strengthA = 0
+			state.strengthB = 0
+			state.maxA = 200
+			state.maxB = 200
+			state.lastStrengthA = 0
+			state.lastStrengthB = 0
+			state.waveIdxA = -1
+			state.waveIdxB = -1
+
+			// 重置 MPRIS 状态
+			if state.propsA != nil {
+				updatePlaybackStatusLocked(1, "Stopped")
+			}
+			if state.propsB != nil {
+				updatePlaybackStatusLocked(2, "Stopped")
+			}
+			updateMetadataLocked()
+
+			// 重置 boundCh 和 pairOnce 以允许重新配对
+			boundCh = make(chan struct{})
+			pairOnce = sync.Once{}
 		}
 		state.mu.Unlock()
-		log.Println("[WS] ⚠️ APP 连接已断开")
+
+		log.Println("[WS] ⚠️ APP 连接已断开，状态已归零")
 		// 通知 TUI 显示二维码（使用 select 防止通道关闭后 panic）
 		select {
 		case qrDisconnectedCh <- struct{}{}:
@@ -842,10 +759,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[WS] bind 处理: 收到 TargetID=%s 我们的 clientID=%s 分配的 appID=%s\n",
 				msg.TargetID, state.clientID, appID)
 			if msg.TargetID == state.clientID || msg.TargetID == appID {
-				// 获取 APP 的真实 ID (它在 clientId 字段中发给我们)
-				appRealID := msg.ClientID
-				if appRealID == "" {
-					appRealID = appID
+				// 根据 dglab-socketv2 协议:
+				// APP bind 请求中 clientId = QR码路径中的Web端ID, targetId = APP自己的ID
+				// 当 msg.TargetID == appID 时，APP 的真实 ID 就是 appID
+				// 当 msg.TargetID == state.clientID 时（旧版兼容），APP 的真实 ID 在 clientId 中
+				appRealID := msg.TargetID
+				if appRealID == state.clientID {
+					// 旧版兼容：targetId 是我们的 ID，APP 的 ID 在 clientId 中
+					appRealID = msg.ClientID
+					if appRealID == "" {
+						appRealID = appID
+					}
 				}
 
 				state.targetID = appRealID
@@ -876,13 +800,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				// 启动心跳
 				go startHeartbeat(conn, appID, quitCh)
 
-				// 通知主 goroutine
-				select {
-				case boundCh <- struct{}{}:
-					log.Printf("[WS] boundCh 已发送！\n")
-				default:
-					log.Printf("[WS] boundCh 发送失败 (可能已满)\n")
-				}
+				// 通知主 goroutine 和 TUI (广播)
+				pairOnce.Do(func() {
+					close(boundCh)
+					log.Printf("[WS] boundCh 已关闭 (广播成功)！\n")
+				})
 			} else {
 				state.mu.Unlock()
 				log.Printf("[WS] 绑定目标不匹配: got=%s, want=%s 或 %s\n", msg.TargetID, state.clientID, appID)
@@ -967,6 +889,21 @@ func waveLoop(channelName string, getWaveIdx func() int, quitCh <-chan struct{})
 			updateMetadataLocked()
 			state.mu.Unlock()
 			time.Sleep(waveClearDelay) // 使用常量
+		}
+
+		// 检查是否应该暂停发送波形（强度为 0 时不发送波形）
+		state.mu.Lock()
+		isPaused := false
+		if channelName == "A" {
+			isPaused = (state.strengthA == 0)
+		} else {
+			isPaused = (state.strengthB == 0)
+		}
+		state.mu.Unlock()
+
+		if isPaused {
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
 
 		if idx >= 0 && idx < len(waveData) {
@@ -1236,58 +1173,62 @@ func main() {
 	go waveLoop("A", func() int { return state.waveIdxA }, quitCh)
 	go waveLoop("B", func() int { return state.waveIdxB }, quitCh)
 
-	// 确定绑定地址
-	bindAddr := *host
-	if bindAddr == "" {
-		addrs := getLocalAddresses()
-		if len(addrs) == 0 {
-			fmt.Println("  ⚠️ 未检测到可用网络接口，使用 0.0.0.0")
-			bindAddr = "0.0.0.0"
-		} else {
-			// 先用简单 TUI 选择地址
-			bindAddr = selectAddressOnlyTUI(addrs, *port, state.clientID)
-			if bindAddr == "" {
-				log.Println("未选择地址，退出")
-				os.Exit(0)
-			}
-		}
-	}
+	// 启动统一 TUI
+	addrCh := make(chan string, 1)
+	model := NewSelectAddressModel(getLocalAddresses(), addrCh, *port, state.clientID, qrDisconnectedCh)
+	p := tea.NewProgram(model)
 
-	// 计算 qrHost（无论地址是来自参数还是选择）
-	addrs := getLocalAddresses()
-	qrHost := bindAddr
-	if bindAddr == "0.0.0.0" {
-		for _, a := range addrs {
-			if a.IP != "127.0.0.1" {
-				qrHost = a.IP
-				break
-			}
-		}
-		if qrHost == "0.0.0.0" || qrHost == "" {
-			qrHost = "localhost"
-		}
-	}
-	listenAddr := fmt.Sprintf("%s:%d", bindAddr, *port)
-	state.listenAddr = listenAddr
-
-	http.HandleFunc("/", wsHandler)
-
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("[WS] 绑定端口失败: %v\n", err)
-	}
-	log.Printf("[WS] 正在监听 %s ...\n", listenAddr)
-
+	// 在后台等待地址选择并启动服务器
 	go func() {
-		if err := http.Serve(listener, nil); err != nil {
-			log.Printf("[WS] 服务器异常: %v\n", err)
+		bindAddr := <-addrCh
+		listenAddr := fmt.Sprintf("%s:%d", bindAddr, *port)
+		state.mu.Lock()
+		state.listenAddr = listenAddr
+		state.mu.Unlock()
+
+		http.HandleFunc("/", wsHandler)
+		// 监听所有接口以避免 RST 问题 (参照 dglab-socketv2 不需要绑定特定 IP)
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+		if err != nil {
+			log.Printf("[WS] 绑定端口失败: %v\n", err)
+			return
 		}
+		log.Printf("[WS] 正在监听 %s ...\n", listenAddr)
+
+		// 启动 WebSocket 服务器
+		go func() {
+			if err := http.Serve(listener, nil); err != nil {
+				log.Printf("[WS] 服务器异常: %v\n", err)
+			}
+		}()
+
+		// 等待连接成功后注册 MPRIS
+		<-boundCh
+		log.Println("[MPRIS] APP 已连接，正在注册服务...")
+
+		propsA, connA, err := registerMPRISChannel("A", 1, "DG-LAB A通道")
+		if err != nil {
+			log.Printf("[MPRIS] A 通道注册失败: %v\n", err)
+		}
+		propsB, connB, err := registerMPRISChannel("B", 2, "DG-LAB B通道")
+		if err != nil {
+			log.Printf("[MPRIS] B 通道注册失败: %v\n", err)
+		}
+
+		state.mu.Lock()
+		state.propsA = propsA
+		state.propsB = propsB
+		state.dbusConnA = connA
+		state.dbusConnB = connB
+		state.mprisReady = true
+		state.mu.Unlock()
 	}()
 
-	tuiQuit := selectBindAddressTUI(bindAddr, *port, state.clientID)
-	if tuiQuit {
-		log.Println("用户退出 TUI")
+	if _, err := p.Run(); err != nil {
+		log.Printf("TUI 运行错误: %v\n", err)
 	}
+
+	resetTerminal()
 
 	log.Println("\n正在退出...")
 	// 通知后台 goroutine 优雅停止
